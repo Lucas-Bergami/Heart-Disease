@@ -1,0 +1,13 @@
+venv/
+costs/
+resultados_*/
+*.data
+*.mod
+heart-disease.names
+Index
+WARNING
+bak
+ask-detrano
+*.ignore
+*.txt
+*.pdf
