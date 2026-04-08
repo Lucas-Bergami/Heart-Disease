@@ -82,33 +82,54 @@ sns.countplot(x="exang", hue="num", data=df)
 plt.title("Angina vs Doença")
 salvar_plot("angina_vs_doenca", pastas["categoricos"])
 
-# ==============================
-# 8. COMPARAÇÕES
-# ==============================
 
-sns.boxplot(x="num", y="age", data=df)
-plt.title("Idade vs Doença")
-salvar_plot("idade_vs_doenca", pastas["comparacoes"])
+# ==============================
+# COMPARAÇÃO AUTOMÁTICA COM 'num'
+# ==============================
+# criar função de salvar gráfico se não existir
+def salvar_plot_auto(nome, pasta):
+    if not os.path.exists(pasta):
+        os.makedirs(pasta)
+    plt.savefig(os.path.join(pasta, f"{nome}.png"))
+    plt.close()
 
-sns.boxplot(x="num", y="thalach", data=df)
-plt.title("Frequência Cardíaca vs Doença")
-salvar_plot("freq_cardiaca_vs_doenca", pastas["comparacoes"])
+
+# percorrer todas as colunas exceto 'num'
+for col in df.columns:
+    if col == "num":
+        continue
+
+    plt.figure(figsize=(8, 6))
+
+    if pd.api.types.is_numeric_dtype(df[col]):
+        sns.boxplot(x="num", y=col, data=df)
+        plt.title(f"{col} vs Doença (Boxplot)")
+        salvar_plot_auto(f"{col}_vs_doenca_boxplot", pastas["comparacoes"])
+
+        sns.violinplot(x="num", y=col, data=df)
+        plt.title(f"{col} vs Doença (Violin)")
+        salvar_plot_auto(f"{col}_vs_doenca_violin", pastas["comparacoes"])
+
+    # se categórica -> countplot
+    else:
+        sns.countplot(x=col, hue="num", data=df)
+        plt.title(f"{col} vs Doença (Countplot)")
+        salvar_plot_auto(f"{col}_vs_doenca_countplot", pastas["comparacoes"])
 # ==============================
 # EXEMPLO DE REGISTRO
 # ==============================
 
-linha = df.sample(1).iloc[0]
+# linha = df.sample(1).iloc[0]
 
-print("\n=== REGISTRO DO DATASET ===")
-for coluna, valor in linha.items():
-    print(f"{coluna}: {valor}")
+# print("\n=== REGISTRO DO DATASET ===")
+# for coluna, valor in linha.items():
+#     print(f"{coluna}: {valor}")
 
-print(heart_disease.variables)
-df = pd.read_csv("./arquivo.data", header=None)
+# print(heart_disease.variables)
+
 # ==============================
 # 9. CORRELAÇÃO
 # ==============================
-
 plt.figure(figsize=(10, 8))
 sns.heatmap(df.corr(), annot=True, cmap="coolwarm")
 plt.title("Correlação entre Variáveis")
