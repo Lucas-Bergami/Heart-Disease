@@ -8,7 +8,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 from datetime import datetime
-
+from sklearn.tree import export_graphviz
+from sklearn.tree import plot_tree
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
@@ -398,7 +399,7 @@ for fold, (train_idx, test_idx) in enumerate(kf.split(X, y)):
     y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
     # ==============================
-    # NORMALIZAÇÃO (SEM VAZAMENTO)
+    # NORMALIZAÇÃO
     # ==============================
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
@@ -641,6 +642,40 @@ for i in range(3):
 plt.suptitle("Comparação das Matrizes de Confusão")
 
 salvar_plot("comparacao_matrizes", pastas["comparacao_modelos"])
+
+# ==============================
+# ÁRVORE FINAL (TREINADA EM TODO O DATASET)
+# ==============================
+
+tree_final = DecisionTreeClassifier(max_depth=5, random_state=42)
+tree_final.fit(X, y)
+
+# ==============================
+# IMPORTÂNCIA DAS VARIÁVEIS
+# ==============================
+plt.figure(figsize=(10, 5))
+
+importancias = pd.Series(tree_final.feature_importances_, index=X.columns)
+importancias.sort_values(ascending=False).plot(kind="bar")
+
+plt.title("Importância das Variáveis - Decision Tree")
+
+salvar_plot("importancia_variaveis_tree", pastas["comparacao_modelos"])
+
+plt.figure(figsize=(20, 10))
+
+plot_tree(
+    tree_final,
+    feature_names=X.columns,
+    class_names=["Sem Doença", "Com Doença"],
+    filled=True,
+    rounded=True,
+    fontsize=8,
+)
+
+plt.title("Árvore de Decisão Final")
+
+salvar_plot("arvore_decisao", pastas["comparacao_modelos"])
 
 # ==============================
 # 13. K-MEANS FINAL (VISUALIZAÇÃO)
