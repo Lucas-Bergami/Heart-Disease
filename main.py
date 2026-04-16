@@ -22,6 +22,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.neighbors import KNeighborsClassifier
+from scipy.stats import wilcoxon, friedmanchisquare
 
 # ==============================
 # 2. CONFIGURAÇÕES
@@ -734,3 +735,62 @@ with open(resultados_path, "a") as f:
     f.write(str(cm_clusters))
 
 print(f"\nResultados salvos em: {base_dir}")
+
+
+# ==============================
+# 15. TESTES NÃO PARAMÉTRICOS
+# ==============================
+
+print("\n=== TESTES ESTATÍSTICOS ===\n")
+
+# ==============================
+# FRIEDMAN (todos os modelos)
+# ==============================
+stat_friedman, p_friedman = friedmanchisquare(
+    resultados["logistic"]["f1"],
+    resultados["knn"]["f1"],
+    resultados["tree"]["f1"]
+)
+
+print(f"Friedman Test -> p-value: {p_friedman:.4f}")
+
+# ==============================
+# WILCOXON (pares)
+# ==============================
+
+def teste_wilcoxon(modelo1, modelo2, nome1, nome2):
+    stat, p = wilcoxon(modelo1, modelo2)
+    print(f"{nome1} vs {nome2} -> p-value: {p:.4f}")
+
+print("\nComparações par a par:")
+
+teste_wilcoxon(resultados["logistic"]["f1"],
+               resultados["knn"]["f1"],
+               "Logistic", "KNN")
+
+teste_wilcoxon(resultados["logistic"]["f1"],
+               resultados["tree"]["f1"],
+               "Logistic", "Tree")
+
+teste_wilcoxon(resultados["knn"]["f1"],
+               resultados["tree"]["f1"],
+               "KNN", "Tree")
+
+# ==============================
+# BOXPLOT DAS MÉTRICAS
+# ==============================
+plt.figure(figsize=(8, 6))
+
+dados_boxplot = [
+    resultados["logistic"]["f1"],
+    resultados["knn"]["f1"],
+    resultados["tree"]["f1"]
+]
+
+sns.boxplot(data=dados_boxplot)
+
+plt.xticks([0, 1, 2], ["Logistic", "KNN", "Tree"])
+plt.ylabel("F1-score")
+plt.title("Distribuição do F1-score por Modelo")
+
+salvar_plot("boxplot_f1_modelos", pastas["comparacao_modelos"])
