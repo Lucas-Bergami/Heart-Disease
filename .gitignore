@@ -11,3 +11,12 @@ ask-detrano
 *.ignore
 *.txt
 *.pdf
+*.zip
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env/
+.ipynb_checkpoints/
+.DS_Store
