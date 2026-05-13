@@ -1,11 +1,37 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.decomposition import DictionaryLearning
+from sklearn.manifold import TSNE
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 import seaborn as sns
 import os
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from datetime import datetime
+from sklearn.model_selection import (
+    StratifiedKFold,
+    cross_val_score,
+    cross_val_predict,
+)
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    f1_score,
+    confusion_matrix,
+    classification_report,
+)
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+
+from xgboost import XGBClassifier
+
+# TABPFN
+from tabpfn import TabPFNClassifier
 
 # ==============================
 # 2. CONFIGURAÇÃO
@@ -20,6 +46,7 @@ pastas = {
     "categoricos": os.path.join(base_dir, "categoricos"),
     "comparacoes": os.path.join(base_dir, "comparacoes"),
     "correlacao": os.path.join(base_dir, "correlacao"),
+    "ml": os.path.join(base_dir, "machine_learning"),
 }
 
 for pasta in pastas.values():
@@ -334,3 +361,298 @@ if "num" in df.columns:
     salvar_plot("top_corr", pastas["correlacao"])
 
 print(f"\nResultados salvos em: {base_dir}")
+
+# ==============================
+# 14. MACHINE LEARNING
+# ==============================
+modelos = {
+    #
+    # "Random Forest": RandomForestClassifier(
+    #     n_estimators=200,
+    #     random_state=42,
+    #     n_jobs=-1,
+    # ),
+    # "Logistic Regression": LogisticRegression(
+    #     max_iter=5000,
+    #     random_state=42,
+    # ),
+    # "XGBoost": XGBClassifier(
+    #     n_estimators=200,
+    #     max_depth=6,
+    #     learning_rate=0.05,
+    #     subsample=0.8,
+    #     colsample_bytree=0.8,
+    #     eval_metric="logloss",
+    #     random_state=42,
+    # ),
+    "TabPFN": TabPFNClassifier(),
+}
+# ==============================
+# FEATURES
+# ==============================
+
+X = df.drop(columns=["num", "dataset_origem"], errors="ignore")
+y = df["num"]
+
+# ==============================
+# CROSS VALIDATION
+# ==============================
+
+skf = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=42,
+)
+
+resultados = {}
+
+for pasta in pastas.values():
+    os.makedirs(pasta, exist_ok=True)
+
+pasta_ml = pastas["ml"]
+
+for nome, modelo in modelos.items():
+    print(f"\n==============================")
+    print(f"Treinando: {nome}")
+    print(f"==============================")
+
+    # ==============================
+    # PREDIÇÃO VIA CROSS VALIDATION
+    # ==============================
+
+    y_pred = cross_val_predict(
+        modelo,
+        X,
+        y,
+        cv=skf,
+        n_jobs=-1,
+    )
+
+    # ==============================
+    # F1 SCORE
+    # ==============================
+
+    f1 = f1_score(y, y_pred)
+
+    resultados[nome] = f1
+
+    print(f"F1-score: {f1:.4f}")
+
+    # ==============================
+    # MATRIZ DE CONFUSÃO
+    # ==============================
+
+    cm = confusion_matrix(y, y_pred)
+
+    plt.figure(figsize=(6, 5))
+
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+    )
+
+    plt.title(f"Matriz de Confusão - {nome}")
+    plt.xlabel("Previsto")
+    plt.ylabel("Real")
+
+    salvar_plot(
+        f"matriz_confusao_{nome.replace(' ', '_')}",
+        pasta_ml,
+    )
+
+    # ==============================
+    # CLASSIFICATION REPORT
+    # ==============================
+
+    report = classification_report(y, y_pred)
+
+    print("\nClassification Report:\n")
+    print(report)
+
+    with open(
+        os.path.join(
+            pasta_ml,
+            f"classification_report_{nome.replace(' ', '_')}.txt",
+        ),
+        "w",
+    ) as f:
+        f.write(report)
+
+# ==============================
+# COMPARAÇÃO DOS MODELOS
+# ==============================
+
+plt.figure(figsize=(8, 5))
+
+nomes = list(resultados.keys())
+scores = list(resultados.values())
+
+sns.barplot(
+    x=nomes,
+    y=scores,
+)
+
+plt.ylim(0, 1)
+
+plt.title("Comparação de Modelos (F1-score)")
+plt.ylabel("F1-score")
+
+# mostrar valores
+for i, v in enumerate(scores):
+    plt.text(
+        i,
+        v + 0.01,
+        f"{v:.3f}",
+        ha="center",
+    )
+
+salvar_plot(
+    "comparacao_f1_modelos",
+    pasta_ml,
+)
+
+# ==============================
+# RESULTADOS FINAIS
+# ==============================
+
+print("\n=== RESULTADOS FINAIS ===")
+
+for nome, score in resultados.items():
+    print(f"{nome}: {score:.4f}")
+
+# ==============================
+# EXTRAIR REPRESENTAÇÕES TABPFN
+# ==============================
+
+
+print("\nExtraindo representações TabPFN")
+
+modelo_tabpfn = modelos["TabPFN"]
+
+modelo_tabpfn.fit(X, y)
+
+modelo = modelo_tabpfn.model_
+
+modelo.eval()
+
+device = next(modelo.parameters()).device
+
+print("Device:", device)
+
+# ==============================
+# TENSOR
+# ==============================
+
+X_tensor = torch.tensor(
+    X.values,
+    dtype=torch.float32,
+    device=device,
+)
+
+num_train = X_tensor.shape[0]
+
+# ==============================
+# PREPROCESSAMENTO INTERNO
+# ==============================
+
+with torch.no_grad():
+    preprocessado = modelo._preprocess_raw(
+        X_tensor,
+        num_train=num_train,
+    )
+
+# primeira saída
+X_proc = preprocessado[0]
+
+print("Shape preprocessado:", X_proc.shape)
+
+# ==============================
+# AJUSTAR DIMENSÕES
+# ==============================
+
+
+if X_proc.shape[0] < X_proc.shape[1]:
+    embeddings = X_proc.T
+else:
+    embeddings = X_proc
+
+print("Shape embeddings:", embeddings.shape)
+
+# ==============================
+# CONVERTER PARA NUMPY
+# ==============================
+
+embeddings_np = embeddings.detach().cpu().numpy()
+
+# garantir 2D
+if embeddings_np.ndim == 1:
+    embeddings_np = embeddings_np.reshape(-1, 1)
+
+print("Shape numpy:", embeddings_np.shape)
+
+# ==============================
+# NORMALIZAÇÃO
+# ==============================
+
+scaler = StandardScaler()
+
+embeddings_scaled = scaler.fit_transform(embeddings_np)
+
+# ==============================
+# PCA
+# ==============================
+
+pca = PCA(n_components=10)
+
+embeddings_pca = pca.fit_transform(embeddings_scaled)
+
+print("Shape PCA:", embeddings_pca.shape)
+
+# ==============================
+# DATAFRAME
+# ==============================
+
+df_embeddings = pd.DataFrame(
+    embeddings_pca, columns=[f"embedding_{i}" for i in range(embeddings_pca.shape[1])]
+)
+
+df_embeddings["target"] = y.values
+
+# ==============================
+# SALVAR
+# ==============================
+
+caminho_embeddings = os.path.join(
+    pasta_ml,
+    "tabpfn_embeddings_pca.csv",
+)
+
+df_embeddings.to_csv(
+    caminho_embeddings,
+    index=False,
+)
+
+print(f"Embeddings salvos em: {caminho_embeddings}")
+
+# ==============================
+# VISUALIZAÇÃO PCA
+# ==============================
+
+plt.figure(figsize=(8, 6))
+
+sns.scatterplot(
+    x=df_embeddings["embedding_0"],
+    y=df_embeddings["embedding_1"],
+    hue=df_embeddings["target"],
+)
+
+plt.title("Representações Latentes TabPFN (PCA)")
+plt.xlabel("PCA 1")
+plt.ylabel("PCA 2")
+
+salvar_plot(
+    "tabpfn_embeddings_pca",
+    pasta_ml,
+)
