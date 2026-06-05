@@ -1,4 +1,5 @@
 import pandas as pd
+import gc
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -425,7 +426,7 @@ for nome, modelo in modelos.items():
         X,
         y,
         cv=skf,
-        n_jobs=-1,
+        n_jobs=1,
     )
 
     # ==============================
@@ -523,105 +524,104 @@ for nome, score in resultados.items():
     print(f"{nome}: {score:.4f}")
 
 # ==============================
-# EXTRAIR REPRESENTAÇÕES TABPFN
+# REPRESENTAÇÃO TABPFN
 # ==============================
 
+print("\nGerando representações TabPFN")
 
-print("\nExtraindo representações TabPFN")
+modelo_tabpfn = TabPFNClassifier(
+    device="cuda",
+)
+gc.collect()
 
-modelo_tabpfn = modelos["TabPFN"]
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    print("GPU:", torch.cuda.get_device_name(0))
+else:
+    print("CUDA não disponível")
 
 modelo_tabpfn.fit(X, y)
 
-modelo = modelo_tabpfn.model_
+batch = 128
 
-modelo.eval()
+partes = []
 
-device = next(modelo.parameters()).device
+for i in range(0, len(X), batch):
+    partes.append(modelo_tabpfn.predict_proba(X.iloc[i : i + batch]))
 
-print("Device:", device)
+probs = np.vstack(partes)
+
+print("Shape probs:", probs.shape)
+
+# remover redundância binária
+# classe positiva apenas
+
+if probs.shape[1] == 2:
+    probs = probs[:, 1].reshape(-1, 1)
+
+print("Shape probs ajustado:", probs.shape)
 
 # ==============================
-# TENSOR
+# CONCATENAR FEATURES + REPRESENTAÇÃO
 # ==============================
 
-X_tensor = torch.tensor(
-    X.values,
-    dtype=torch.float32,
-    device=device,
+X_latente = np.concatenate(
+    [
+        X.values,
+        probs,
+    ],
+    axis=1,
 )
 
-num_train = X_tensor.shape[0]
+print("Shape espaço latente:", X_latente.shape)
 
 # ==============================
-# PREPROCESSAMENTO INTERNO
-# ==============================
-
-with torch.no_grad():
-    preprocessado = modelo._preprocess_raw(
-        X_tensor,
-        num_train=num_train,
-    )
-
-# primeira saída
-X_proc = preprocessado[0]
-
-print("Shape preprocessado:", X_proc.shape)
-
-# ==============================
-# AJUSTAR DIMENSÕES
-# ==============================
-
-
-if X_proc.shape[0] < X_proc.shape[1]:
-    embeddings = X_proc.T
-else:
-    embeddings = X_proc
-
-print("Shape embeddings:", embeddings.shape)
-
-# ==============================
-# CONVERTER PARA NUMPY
-# ==============================
-
-embeddings_np = embeddings.detach().cpu().numpy()
-
-# garantir 2D
-if embeddings_np.ndim == 1:
-    embeddings_np = embeddings_np.reshape(-1, 1)
-
-print("Shape numpy:", embeddings_np.shape)
-
-# ==============================
-# NORMALIZAÇÃO
+# PADRONIZAÇÃO
 # ==============================
 
 scaler = StandardScaler()
 
-embeddings_scaled = scaler.fit_transform(embeddings_np)
+X_scaled = scaler.fit_transform(X_latente)
 
 # ==============================
-# PCA
+# REDUÇÃO DE DIMENSÃO
+# (igual ideia do artigo)
 # ==============================
 
-pca = PCA(n_components=10)
+n_comp = min(
+    10,
+    X_scaled.shape[1],
+)
 
-embeddings_pca = pca.fit_transform(embeddings_scaled)
+pca = PCA(
+    n_components=n_comp,
+    random_state=42,
+)
 
-print("Shape PCA:", embeddings_pca.shape)
+embeddings = pca.fit_transform(X_scaled)
+
+print("Shape embeddings:", embeddings.shape)
+
+print(
+    "Variância explicada:",
+    pca.explained_variance_ratio_.sum(),
+)
 
 # ==============================
 # DATAFRAME
 # ==============================
 
+colunas = [f"embedding_{i}" for i in range(embeddings.shape[1])]
+
 df_embeddings = pd.DataFrame(
-    embeddings_pca, columns=[f"embedding_{i}" for i in range(embeddings_pca.shape[1])]
+    embeddings,
+    columns=colunas,
 )
 
 df_embeddings["target"] = y.values
 
 # ==============================
-# SALVAR
+# SALVAR CSV
 # ==============================
 
 caminho_embeddings = os.path.join(
@@ -634,25 +634,141 @@ df_embeddings.to_csv(
     index=False,
 )
 
-print(f"Embeddings salvos em: {caminho_embeddings}")
+print(f"Embeddings salvos em:\n{caminho_embeddings}")
 
 # ==============================
-# VISUALIZAÇÃO PCA
+# VISUALIZAÇÃO 2D
 # ==============================
+
+if embeddings.shape[1] >= 2:
+    plt.figure(figsize=(8, 6))
+
+    sns.scatterplot(
+        x=df_embeddings["embedding_0"],
+        y=df_embeddings["embedding_1"],
+        hue=df_embeddings["target"],
+    )
+
+    plt.title("Representação Latente TabPFN + PCA")
+
+    plt.xlabel("Componente 1")
+
+    plt.ylabel("Componente 2")
+
+    salvar_plot(
+        "tabpfn_embeddings_pca",
+        pasta_ml,
+    )
+
+# ==============================
+# IMPORTÂNCIA DAS FEATURES
+# (interpretabilidade)
+# ==============================
+
+importancias = np.abs(pca.components_).mean(axis=0)
+
+# ==============================
+# IMPORTÂNCIA DAS FEATURES
+# ==============================
+
+importancias = np.abs(pca.components_).mean(axis=0)
+
+nomes = list(X.columns)
+
+if probs.shape[1] == 1:
+    nomes.append("tabpfn_prob")
+else:
+    nomes.extend([f"tabpfn_prob_{i}" for i in range(probs.shape[1])])
+
+# garantir tamanhos iguais
+tam = min(
+    len(nomes),
+    len(importancias),
+)
+
+df_importancia = pd.DataFrame(
+    {
+        "feature": nomes[:tam],
+        "importance": importancias[:tam],
+    }
+)
+
+df_importancia = df_importancia.sort_values(
+    "importance",
+    ascending=False,
+)
+
+print("\nTop 10 atributos:")
+
+print(df_importancia.head(10))
+
+df_importancia.to_csv(
+    os.path.join(
+        pasta_ml,
+        "feature_importance_pca.csv",
+    ),
+    index=False,
+)
 
 plt.figure(figsize=(8, 6))
 
-sns.scatterplot(
-    x=df_embeddings["embedding_0"],
-    y=df_embeddings["embedding_1"],
-    hue=df_embeddings["target"],
+sns.barplot(
+    data=df_importancia.head(10),
+    x="importance",
+    y="feature",
 )
 
-plt.title("Representações Latentes TabPFN (PCA)")
-plt.xlabel("PCA 1")
-plt.ylabel("PCA 2")
+plt.title("Importância das Variáveis")
 
 salvar_plot(
-    "tabpfn_embeddings_pca",
+    "feature_importance_pca",
     pasta_ml,
 )
+
+nomes = list(X.columns)
+
+if probs.shape[1] == 1:
+    nomes += ["tabpfn_prob"]
+else:
+    nomes += [f"tabpfn_prob_{i}" for i in range(probs.shape[1])]
+
+df_importancia = pd.DataFrame(
+    {
+        "feature": nomes,
+        "importance": importancias,
+    }
+)
+
+df_importancia = df_importancia.sort_values(
+    "importance",
+    ascending=False,
+)
+
+df_importancia.to_csv(
+    os.path.join(
+        pasta_ml,
+        "feature_importance_pca.csv",
+    ),
+    index=False,
+)
+
+print("\nTop 10 atributos:")
+
+print(df_importancia.head(10))
+
+plt.figure(figsize=(8, 6))
+
+sns.barplot(
+    data=df_importancia.head(10),
+    x="importance",
+    y="feature",
+)
+
+plt.title("Features mais importantes")
+
+salvar_plot(
+    "feature_importance_pca",
+    pasta_ml,
+)
+
+print("\nRepresentações concluídas.")
