@@ -85,6 +85,14 @@ N_TCAV_RUNS = 15  # artigo usa N=15
 TCAV_EFFECT_MIN = 0.10  # |TCAV − 0.5| ≥ 0.1
 FDR_ALPHA = 0.05
 RANDOM_STATE = 42
+
+DL_N_COMPONENTS = 8  # artigo usa K=8 para Dictionary Learning (baseline)
+
+# RANDOM_STATE: seed gerada aleatoriamente a cada execução do script.
+# Para reproduzir um resultado específico depois, anote o valor impresso
+# no console ("Seed desta execução: ...") e fixe-o manualmente aqui.
+RANDOM_STATE = np.random.randint(0, 2**31 - 1)
+print(f"Seed desta execução: {RANDOM_STATE}")
 # ────────────────────────────────────────────────────────────────────────────
 
 colunas_remover = [
@@ -327,7 +335,7 @@ for nome, score in resultados.items():
 
 
 # ============================================================
-# BLOCO SAE + TCAV
+# BLOCO SAE + TCAV  (fiel ao artigo)
 # ============================================================
 
 print("\n" + "=" * 60)
@@ -618,6 +626,157 @@ acts_tcav_eval = get_activations(emb_tcav_eval)
 acts_held_out = get_activations(emb_held_out)
 
 
+# ============================================================
+# DICTIONARY LEARNING — Baseline Linear (artigo seção 3.3 e Tabela 1)
+# ============================================================
+# O artigo compara SAE (não-linear, overcomplete) contra Dictionary
+# Learning (linear, compacto, K=8) para justificar a escolha do SAE.
+#
+# DL resolve: min_Φ,c  Σ ||z_i - Φc_i||² + λ||c_i||₁   s.t. ||φ_k|| ≤ 1
+# usando sklearn.decomposition.DictionaryLearning
+
+print(
+    f"\n[3b/6] Treinando Dictionary Learning (K={DL_N_COMPONENTS}) para comparação..."
+)
+
+from sklearn.decomposition import DictionaryLearning
+
+dl = DictionaryLearning(
+    n_components=DL_N_COMPONENTS,
+    alpha=1.0,  # equivalente ao λ do artigo
+    max_iter=500,
+    random_state=RANDOM_STATE,
+    transform_algorithm="lasso_lars",  # produz códigos esparsos
+)
+
+# Treina no mesmo split de discovery usado pelo SAE (comparação justa)
+codigos_dl = dl.fit_transform(emb_disc)  # (n_disc, K) — códigos esparsos c_i
+dicionario_dl = dl.components_  # (K, D)     — átomos Φ
+
+# Reconstrução: z_hat = c @ Φ
+emb_disc_reconstruido_dl = codigos_dl @ dicionario_dl
+
+
+def calcular_metricas_decomposicao(z_original, z_reconstruido, ativacoes, direcoes):
+    """
+    Réplica das 4 métricas da Tabela 1 do artigo:
+      - MSE de reconstrução
+      - Sparsity (% de ativações |.| < 1e-5)
+      - Active/Sample (unidades ativas por amostra, em média)
+      - Direction Similarity (% de pares de direções com cos_sim > 0.5)
+    """
+    mse = float(np.mean((z_original - z_reconstruido) ** 2))
+
+    near_zero = float((np.abs(ativacoes) < 1e-5).mean())
+    active_per_sample_ = float((np.abs(ativacoes) >= 1e-5).sum(axis=1).mean())
+
+    norms = np.linalg.norm(direcoes, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    direcoes_norm = direcoes / norms
+    cos_sim = np.abs(direcoes_norm @ direcoes_norm.T)
+    np.fill_diagonal(cos_sim, 0)
+    n_pares = cos_sim.shape[0] * (cos_sim.shape[0] - 1) / 2
+    pct_pares_similares = (
+        float((cos_sim > 0.5).sum() / 2 / n_pares) if n_pares > 0 else 0.0
+    )
+
+    return {
+        "mse": mse,
+        "sparsity": near_zero,
+        "active_per_sample": active_per_sample_,
+        "n_units": ativacoes.shape[1],
+        "pct_direction_sim": pct_pares_similares,
+    }
+
+
+metricas_dl = calcular_metricas_decomposicao(
+    z_original=emb_disc,
+    z_reconstruido=emb_disc_reconstruido_dl,
+    ativacoes=codigos_dl,
+    direcoes=dicionario_dl,
+)
+
+# MSE do SAE no mesmo split (discovery), para comparação justa
+with torch.no_grad():
+    z_hat_sae_disc, _ = sae(X_sae)
+    mse_sae = float(((z_hat_sae_disc - X_sae) ** 2).mean().cpu())
+
+metricas_sae = {
+    "mse": mse_sae,
+    "sparsity": near_zero_rate,
+    "active_per_sample": active_per_sample,
+    "n_units": LATENT_DIM,
+    "pct_direction_sim": (
+        float(high_sim_pairs / (LATENT_DIM * (LATENT_DIM - 1) / 2))
+        if LATENT_DIM > 1
+        else 0.0
+    ),
+}
+
+df_comparacao_decomposicao = pd.DataFrame(
+    [
+        {
+            "Method": "Dictionary Learning",
+            "MSE": round(metricas_dl["mse"], 4),
+            "Sparsity": f"{metricas_dl['sparsity']:.1%}",
+            "Active/Sample": f"{metricas_dl['active_per_sample']:.1f} / {metricas_dl['n_units']}",
+            "Direction Sim. (>0.5)": f"{metricas_dl['pct_direction_sim']:.1%}",
+        },
+        {
+            "Method": "Sparse Autoencoder",
+            "MSE": round(metricas_sae["mse"], 4),
+            "Sparsity": f"{metricas_sae['sparsity']:.1%}",
+            "Active/Sample": f"{metricas_sae['active_per_sample']:.1f} / {metricas_sae['n_units']}",
+            "Direction Sim. (>0.5)": f"{metricas_sae['pct_direction_sim']:.1%}",
+        },
+    ]
+)
+
+print("\n  Tabela 1 — Qualidade da Decomposição (DL vs SAE):")
+print(df_comparacao_decomposicao.to_string(index=False))
+
+df_comparacao_decomposicao.to_csv(
+    os.path.join(pasta_ml, "comparacao_dl_vs_sae.csv"), index=False
+)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+metodos = ["Dictionary\nLearning", "Sparse\nAutoencoder"]
+cores_metodo = ["#94A3B8", "#7C3AED"]
+
+axes[0].bar(metodos, [metricas_dl["mse"], metricas_sae["mse"]], color=cores_metodo)
+axes[0].set_yscale("log")
+axes[0].set_title("MSE de Reconstrução\n(menor é melhor)")
+axes[0].set_ylabel("MSE (log)")
+
+axes[1].bar(
+    metodos,
+    [metricas_dl["sparsity"] * 100, metricas_sae["sparsity"] * 100],
+    color=cores_metodo,
+)
+axes[1].set_title("Sparsity\n(% ativações ≈ 0)")
+axes[1].set_ylabel("%")
+axes[1].set_ylim(0, 100)
+
+axes[2].bar(
+    metodos,
+    [metricas_dl["pct_direction_sim"] * 100, metricas_sae["pct_direction_sim"] * 100],
+    color=cores_metodo,
+)
+axes[2].set_title("Pares com cos_sim > 0.5\n(menor é melhor)")
+axes[2].set_ylabel("%")
+
+salvar_plot("comparacao_dl_vs_sae", pasta_ml)
+
+print(f"\n  Interpretação:")
+if metricas_sae["mse"] < metricas_dl["mse"]:
+    reducao = (1 - metricas_sae["mse"] / metricas_dl["mse"]) * 100
+    print(
+        f"  SAE reduz o erro de reconstrução em {reducao:.1f}% vs Dictionary Learning"
+    )
+if metricas_sae["pct_direction_sim"] < metricas_dl["pct_direction_sim"]:
+    print(f"  SAE produz direções mais ortogonais (menos redundância entre conceitos)")
+
+
 # ── 6. DECISION TREE POR FATOR ───────────────────────────────────────────────
 # Threshold = percentil 50 das ativações positivas (artigo seção 3.5)
 # Retém fator somente se precisão ≥ 0.9 E recall ≥ 0.25
@@ -627,6 +786,78 @@ print(
 )
 
 conceitos_candidatos = []
+
+
+def extrair_regra_completa(dt: DecisionTreeClassifier, feature_names: list) -> str:
+    """
+    Percorre a árvore do nó raiz até a folha com maior precisão para a classe
+    positiva (1), retornando a conjunção COMPLETA de condições no caminho
+    — não apenas o primeiro split. Formato: 'cond1 AND cond2 AND cond3 ...'
+    Réplica do estilo de regra usado na Tabela 2 do artigo (ex.:
+    "10.5 < EVENT_C1DIALISE_HD <= 13.5 AND EVENT_c5TX_EXTX <= 0.5").
+    """
+    tree = dt.tree_
+
+    # Identificar a folha (classe 1) com maior número de amostras positivas
+    # entre as folhas que predizem a classe positiva.
+    leaf_ids = [i for i in range(tree.node_count) if tree.children_left[i] == -1]
+    melhor_leaf, melhor_score = None, -1
+    for leaf in leaf_ids:
+        valores = tree.value[leaf][0]
+        classe_pred = int(np.argmax(valores))
+        if classe_pred == 1:
+            score = valores[
+                1
+            ]  # peso (amostras, ponderado por class_weight) da classe 1
+            if score > melhor_score:
+                melhor_score, melhor_leaf = score, leaf
+
+    if melhor_leaf is None:
+        return "nenhuma folha prediz classe positiva"
+
+    # Reconstruir o caminho da raiz até essa folha
+    def caminho_para_no(node_id, caminho=()):
+        if node_id == melhor_leaf:
+            return caminho
+        esq, dir_ = tree.children_left[node_id], tree.children_right[node_id]
+        if esq != -1:
+            r = caminho_para_no(esq, caminho + ((node_id, "esq"),))
+            if r is not None:
+                return r
+        if dir_ != -1:
+            r = caminho_para_no(dir_, caminho + ((node_id, "dir"),))
+            if r is not None:
+                return r
+        return None
+
+    caminho = caminho_para_no(0)
+    if caminho is None:
+        return "caminho não encontrado"
+
+    # Montar condições, agregando limites min/max por feature (ex: "10.5 < X <= 13.5")
+    limites = {}  # feature_idx -> [lower, upper]
+    for node_id, direcao in caminho:
+        feat_idx = tree.feature[node_id]
+        thresh = tree.threshold[node_id]
+        if feat_idx not in limites:
+            limites[feat_idx] = [-np.inf, np.inf]
+        if direcao == "esq":  # feature <= thresh
+            limites[feat_idx][1] = min(limites[feat_idx][1], thresh)
+        else:  # feature > thresh
+            limites[feat_idx][0] = max(limites[feat_idx][0], thresh)
+
+    condicoes = []
+    for feat_idx, (lo, hi) in limites.items():
+        nome = feature_names[feat_idx]
+        if lo == -np.inf:
+            condicoes.append(f"{nome} <= {hi:.2f}")
+        elif hi == np.inf:
+            condicoes.append(f"{nome} > {lo:.2f}")
+        else:
+            condicoes.append(f"{lo:.2f} < {nome} <= {hi:.2f}")
+
+    return " AND ".join(condicoes)
+
 
 for k in active_factors:
     ativ_k = acts_disc[:, k]
@@ -657,15 +888,7 @@ for k in active_factors:
     recall = tp / (tp + fn + 1e-9)
 
     if precisao >= DT_PRECISION_MIN and recall >= DT_RECALL_MIN:
-        regra = export_text(dt, feature_names=feature_names, max_depth=2)
-        regra_resumida = next(
-            (
-                l.strip().replace("|--- ", "")
-                for l in regra.split("\n")
-                if l.strip() and "|---" in l
-            ),
-            "ver DT",
-        )[:80]
+        regra_completa = extrair_regra_completa(dt, feature_names)
 
         conceitos_candidatos.append(
             {
@@ -673,7 +896,7 @@ for k in active_factors:
                 "precisao": round(precisao, 3),
                 "recall": round(recall, 3),
                 "threshold_k": threshold_k,
-                "regra": regra_resumida,
+                "regra": regra_completa,
                 "dt_model": dt,
             }
         )
@@ -813,7 +1036,163 @@ if conceitos_finais:
         c["top5_features"] = [feature_names[j] for j in top5_idx]
         c["top5_coef"] = [float(lasso.coef_[j]) for j in top5_idx]
 
-    # ── DataFrame de resultados ──────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # DESTRUCTION TEST E SUFFICIENCY TEST (artigo seção 3.4 / eq. 8-9)
+    # ════════════════════════════════════════════════════════════════════════
+    # O artigo projeta o embedding no espaço nulo do CAV (destruction) ou só
+    # na direção do CAV (sufficiency), e mede como a predição do modelo muda.
+    #
+    # Limitação prática: o TabPFN não expõe um "decoder" que aceite embeddings
+    # diretamente — a predição sempre depende de um forward pass completo com
+    # o contexto de treino. Por isso, a perturbação aqui é feita no espaço de
+    # ENTRADA ORIGINAL (X), usando a direção do CAV mapeada de volta para as
+    # features originais via os coeficientes do LASSO já calculados acima.
+    # Isso preserva a lógica de necessidade/suficiência do artigo (eq. 8-9),
+    # adaptada para um modelo sem acesso direto ao espaço de embedding.
+
+    print(f"\n[7/6] Testes de ablação (Destruction + Sufficiency)...")
+
+    def construir_direcao_em_X(c, feature_names_list):
+        """
+        Constrói um vetor direção no espaço de X (features originais) a partir
+        dos coeficientes do LASSO que mapeiam o conceito SAE para X. Isso é o
+        equivalente prático ao CAV v_k do artigo, mas no espaço de entrada.
+        """
+        k = c["fator"]
+        ativ = acts_held_out[:, k]
+        lasso_full = Lasso(alpha=0.01, max_iter=5000)
+        lasso_full.fit(X_held_orig, ativ)
+        v = lasso_full.coef_.copy()
+        norma = np.linalg.norm(v)
+        if norma < 1e-9:
+            return None
+        return v / norma
+
+    def predizer_proba(modelo, X_arr):
+        """Probabilidade da classe positiva (1) para um array de amostras."""
+        X_f = np.atleast_2d(X_arr).astype(np.float32)
+        proba = modelo.predict_proba(X_f)
+        return proba[:, 1]
+
+    # Amostras onde o conceito está ATIVO no held-out (via regra DT) — são as
+    # amostras mais informativas para o teste de ablação, conforme o artigo:
+    # "the effect was much stronger in samples where that concept was highly active"
+
+    resultados_ablacao = []
+
+    for c in conceitos_finais:
+        k = c["fator"]
+        dt_k = c["dt_model"]
+        v_dir = construir_direcao_em_X(c, feature_names)
+
+        if v_dir is None:
+            c["destruction_delta"] = None
+            c["sufficiency_delta"] = None
+            continue
+
+        # Amostras held-out onde o conceito está ativo (regra DT = 1)
+        mask_ativo = dt_k.predict(X_held_orig) == 1
+        if mask_ativo.sum() < 3:
+            c["destruction_delta"] = None
+            c["sufficiency_delta"] = None
+            continue
+
+        X_ativo = X_held_orig[mask_ativo]
+
+        # Predição original (baseline) nessas amostras
+        p_original = predizer_proba(modelo_tabpfn, X_ativo)
+
+        # ── Destruction Test (Necessidade) — eq. 8 ──────────────────────────
+        # Remove a componente na direção do conceito: x_destroyed = x - (x·v)v
+        proj_escalar = X_ativo @ v_dir  # (n,)
+        X_destruido = X_ativo - np.outer(proj_escalar, v_dir)
+        p_destruido = predizer_proba(modelo_tabpfn, X_destruido)
+        # Artigo (seção 5.6): "|Δdestroy| < 0.02 on average" — usa o valor
+        # ABSOLUTO do delta por amostra antes de tirar a média. Isso evita que
+        # deltas positivos e negativos se cancelem entre amostras diferentes.
+        delta_por_amostra = np.abs(p_original - p_destruido)
+        delta_destruction = float(np.mean(delta_por_amostra))
+
+        # ── Sufficiency Test — eq. 9 ─────────────────────────────────────────
+        # Mantém SOMENTE a componente na direção do conceito: x_suf = (x·v)v
+        X_suficiente = np.outer(proj_escalar, v_dir)
+        p_suficiente = predizer_proba(modelo_tabpfn, X_suficiente)
+        # Quanto da predição original o modelo retém usando só essa direção
+        delta_sufficiency = float(np.mean(p_suficiente) - np.mean(p_original))
+        # Fração da predição original retida (1.0 = suficiente, 0.0 = nada)
+        retencao_sufficiency = (
+            float(np.mean(p_suficiente) / (np.mean(p_original) + 1e-9))
+            if np.mean(p_original) > 1e-9
+            else 0.0
+        )
+
+        c["destruction_delta"] = round(delta_destruction, 4)
+        c["sufficiency_delta"] = round(delta_sufficiency, 4)
+        c["sufficiency_retencao"] = round(retencao_sufficiency, 4)
+        c["n_amostras_ablacao"] = int(mask_ativo.sum())
+
+        resultados_ablacao.append(
+            {
+                "fator": k,
+                "n_amostras_ativas": int(mask_ativo.sum()),
+                "p_original_medio": round(float(np.mean(p_original)), 4),
+                "p_destruido_medio": round(float(np.mean(p_destruido)), 4),
+                "destruction_delta": c["destruction_delta"],
+                "p_suficiente_medio": round(float(np.mean(p_suficiente)), 4),
+                "sufficiency_retencao": c["sufficiency_retencao"],
+                "necessario": bool(
+                    delta_destruction >= 0.02
+                ),  # Δp médio ≥ 0.02 → necessário
+                "suficiente": bool(
+                    retencao_sufficiency >= 0.7
+                ),  # retém ≥70% → suficiente
+            }
+        )
+
+    df_ablacao = pd.DataFrame(resultados_ablacao).sort_values(
+        "destruction_delta", key=lambda s: s.abs(), ascending=False
+    )
+    df_ablacao.to_csv(os.path.join(pasta_ml, "testes_ablacao.csv"), index=False)
+
+    print("\n  Resultados dos testes de ablação:")
+    print(df_ablacao.to_string(index=False))
+
+    n_necessarios = int(df_ablacao["necessario"].sum())
+    n_suficientes = int(df_ablacao["suficiente"].sum())
+    print(f"\n  Conceitos necessários (|Δp|≥0.02): {n_necessarios} / {len(df_ablacao)}")
+    print(
+        f"  Conceitos suficientes (retenção≥70%): {n_suficientes} / {len(df_ablacao)}"
+    )
+
+    # ── Plot: Destruction Δp vs Sufficiency retenção ─────────────────────────
+    if len(df_ablacao) > 0:
+        fig, axes = plt.subplots(1, 2, figsize=(14, max(4, len(df_ablacao) * 0.4 + 2)))
+
+        labels_abl = [f"F{f}" for f in df_ablacao["fator"]]
+        cores_destr = ["#DC2626" if n else "#94A3B8" for n in df_ablacao["necessario"]]
+        cores_suf = ["#16A34A" if s else "#94A3B8" for s in df_ablacao["suficiente"]]
+
+        axes[0].barh(labels_abl, df_ablacao["destruction_delta"], color=cores_destr)
+        axes[0].axvline(0, color="black", linewidth=0.5)
+        axes[0].set_xlabel("Δp (predição original − destruída)")
+        axes[0].set_title("Destruction Test\n(vermelho = necessário, |Δp|≥0.02)")
+
+        axes[1].barh(labels_abl, df_ablacao["sufficiency_retencao"], color=cores_suf)
+        axes[1].axvline(
+            0.7, color="black", linestyle="--", linewidth=0.5, label="limiar 0.7"
+        )
+        axes[1].set_xlabel("Fração da predição retida")
+        axes[1].set_title("Sufficiency Test\n(verde = suficiente, retenção≥0.7)")
+        axes[1].legend(fontsize=8)
+
+        salvar_plot("testes_ablacao", pasta_ml)
+
+    print(f"\n  Interpretação:")
+    print(f"  - 'Necessário': remover a direção do conceito muda a predição em ≥2pp")
+    print(f"  - 'Suficiente': usar SÓ essa direção mantém ≥70% da predição original")
+    print(f"  - Conceitos necessários E suficientes são os candidatos mais fortes a")
+    print(f"    'drivers' causais da decisão do modelo, não apenas correlações.")
+
     df_final = pd.DataFrame(
         [
             {
@@ -828,6 +1207,8 @@ if conceitos_finais:
                 "regra": c["regra"],
                 "top5_features": ", ".join(c["top5_features"]),
                 "interpretacao": "RISCO" if c["tcav_mean"] > 0.5 else "PROTETOR",
+                "destruction_delta": c.get("destruction_delta"),
+                "sufficiency_retencao": c.get("sufficiency_retencao"),
             }
             for c in conceitos_finais
         ]
@@ -903,52 +1284,3 @@ if conceitos_finais:
     ax.set_title("Ativação Média por Conceito e Classe (Held-Out)")
     handles, lbls = ax.get_legend_handles_labels()
     ax.legend(handles[:2], lbls[:2])
-    salvar_plot("ativacao_por_classe", pasta_ml)
-
-    # t-SNE dos embeddings colorido pelo top conceito
-    if len(test_emb) <= 1000:
-        top_fator = conceitos_finais[0]["fator"]
-        ativ_top = acts_held_out[:, top_fator]
-        tsne = TSNE(
-            n_components=2,
-            random_state=RANDOM_STATE,
-            perplexity=min(30, len(emb_held_out) - 1),
-        )
-        emb_2d = tsne.fit_transform(emb_held_out)
-        plt.figure(figsize=(8, 6))
-        sc = plt.scatter(
-            emb_2d[:, 0], emb_2d[:, 1], c=ativ_top, cmap="RdBu_r", alpha=0.7, s=20
-        )
-        plt.colorbar(sc, label=f"Ativação Fator {top_fator}")
-        plt.title(
-            f"t-SNE — Fator {top_fator} (top conceito)\n{conceitos_finais[0]['regra'][:60]}"
-        )
-        salvar_plot(f"tsne_fator_{top_fator}", pasta_ml)
-
-else:
-    print("\n  Nenhum conceito interpretável encontrado.")
-    print("  Parâmetros para relaxar:")
-    print(f"    DT_PRECISION_MIN = {DT_PRECISION_MIN} → tente 0.80")
-    print(f"    DT_RECALL_MIN    = {DT_RECALL_MIN} → tente 0.15")
-    print(f"    TCAV_EFFECT_MIN  = {TCAV_EFFECT_MIN} → tente 0.05")
-    print(f"    SAE_SPARSITY     = {SAE_SPARSITY} → tente 0.01")
-
-# ── Salvar métricas do SAE ───────────────────────────────────────────────────
-pd.DataFrame(
-    [
-        {
-            "embedding_dim": EMBEDDING_DIM,
-            "latent_dim": LATENT_DIM,
-            "expansion_factor": EXPANSION_FACTOR,
-            "near_zero_rate": round(near_zero_rate, 4),
-            "active_per_sample": round(active_per_sample, 2),
-            "dead_factors": len(dead_factors),
-            "active_factors": len(active_factors),
-            "high_sim_pairs": int(high_sim_pairs),
-            "candidatos_dt": len(conceitos_candidatos),
-            "conceitos_finais": len(conceitos_finais),
-        }
-    ]
-).to_csv(os.path.join(pasta_ml, "metricas_sae.csv"), index=False)
-
-print(f"\n✓ Pipeline concluído. Resultados em: {base_dir}/")
