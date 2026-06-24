@@ -84,6 +84,7 @@ DT_RECALL_MIN = 0.25  # artigo: recall   ≥ 0.25
 N_TCAV_RUNS = 15  # artigo usa N=15
 TCAV_EFFECT_MIN = 0.10  # |TCAV − 0.5| ≥ 0.1
 FDR_ALPHA = 0.05
+COHENS_D_MIN = 0.80  # artigo seção 4.2: effect size > 0.8 ("efeito grande")
 RANDOM_STATE = 42
 
 DL_N_COMPONENTS = 8  # artigo usa K=8 para Dictionary Learning (baseline)
@@ -468,6 +469,222 @@ pd.DataFrame(
 ).assign(target=y_test).to_csv(
     os.path.join(pasta_ml, "tabpfn_embeddings_test.csv"), index=False
 )
+
+# ============================================================
+# COMPARAÇÃO: FEATURES ORIGINAIS vs. EMBEDDINGS TABPFN
+# ============================================================
+# Pergunta: o espaço latente do TabPFN carrega informação preditiva extra
+# em relação às features originais, quando usado por OUTROS modelos?
+#
+# Treina RL, RF, XGBoost e TabPFN duas vezes:
+#   (A) nas 38 features originais (X_train_raw / X_test_raw)
+#   (B) nos embeddings normalizados do TabPFN (train_emb / test_emb, 512 dims)
+# Se RL/RF/XGBoost melhorarem no cenário B, o TabPFN está funcionando como
+# um bom extrator de features não-lineares para modelos mais simples.
+
+print("\n" + "=" * 60)
+print("COMPARAÇÃO: FEATURES ORIGINAIS vs. EMBEDDINGS TABPFN")
+print("=" * 60)
+
+# RL precisa de features em escala comparável; RF e XGBoost não precisam,
+# mas normalizar não piora e mantém o código simples para os 3.
+scaler_orig = StandardScaler()
+X_train_orig_n = scaler_orig.fit_transform(X_train_raw)
+X_test_orig_n = scaler_orig.transform(X_test_raw)
+
+
+def avaliar_modelos(
+    X_tr,
+    y_tr,
+    X_te,
+    y_te,
+    modelo_tabpfn_treinado=None,
+    X_te_tabpfn=None,
+    nome_cenario="",
+):
+    """
+    Treina RL, RF, XGBoost (e opcionalmente reusa um TabPFN já treinado)
+    no mesmo split treino/teste, retornando F1, acurácia e relatório por modelo.
+
+    X_te_tabpfn: dados de teste para o TabPFN especificamente. O TabPFN foi
+    treinado em dados BRUTOS (sem normalização) — se receber X_te normalizado
+    (escala/distribuição diferente da vista no fit), a predição degenera e
+    colapsa para uma única classe (F1=0). Por isso o TabPFN sempre recebe seu
+    próprio X_te não normalizado, independente do X_te usado pelos outros 3.
+    """
+    modelos_cenario = {
+        "Logistic Regression": LogisticRegression(
+            max_iter=5000, random_state=RANDOM_STATE
+        ),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1
+        ),
+        "XGBoost": XGBClassifier(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            eval_metric="logloss",
+            random_state=RANDOM_STATE,
+        ),
+    }
+
+    resultados_cenario = {}
+
+    for nome_m, modelo_m in modelos_cenario.items():
+        modelo_m.fit(X_tr, y_tr)
+        y_pred_m = modelo_m.predict(X_te)
+        f1_m = f1_score(y_te, y_pred_m)
+        acc_m = (y_pred_m == y_te).mean()
+        resultados_cenario[nome_m] = {"f1": f1_m, "acc": acc_m}
+        print(f"    {nome_m:<22} | F1={f1_m:.4f} | Acc={acc_m:.4f}")
+
+    # TabPFN: reaproveita o modelo já treinado (evita treinar de novo).
+    # Usa X_te_tabpfn (dados brutos) em vez de X_te (pode estar normalizado).
+    if modelo_tabpfn_treinado is not None:
+        X_te_para_tabpfn = X_te_tabpfn if X_te_tabpfn is not None else X_te
+        y_pred_tabpfn = modelo_tabpfn_treinado.predict(X_te_para_tabpfn)
+        f1_tabpfn = f1_score(y_te, y_pred_tabpfn)
+        acc_tabpfn = (y_pred_tabpfn == y_te).mean()
+        resultados_cenario["TabPFN"] = {"f1": f1_tabpfn, "acc": acc_tabpfn}
+        print(f"    {'TabPFN':<22} | F1={f1_tabpfn:.4f} | Acc={acc_tabpfn:.4f}")
+
+    return resultados_cenario
+
+
+print("\n[A] Treinando nas FEATURES ORIGINAIS (38 dims, normalizadas)...")
+resultados_originais = avaliar_modelos(
+    X_train_orig_n,
+    y_train,
+    X_test_orig_n,
+    y_test,
+    modelo_tabpfn_treinado=modelo_tabpfn,  # já treinado em X_train_raw
+    X_te_tabpfn=X_test_raw,  # TabPFN recebe dados BRUTOS, não normalizados
+    nome_cenario="originais",
+)
+
+
+print(f"\n[B] Treinando nos EMBEDDINGS TABPFN ({EMBEDDING_DIM} dims, normalizados)...")
+# Para o TabPFN no cenário B, é preciso um modelo NOVO treinado a partir dos
+# embeddings como se fossem features de entrada — o TabPFN original não
+# "recebe" embeddings como X, então aqui ele funciona apenas como gerador
+# de representação para os outros 3 modelos. Reportamos o TabPFN original
+# (cenário A) como referência na mesma linha para comparação visual.
+resultados_embedding = avaliar_modelos(
+    train_emb,
+    y_train,
+    test_emb,
+    y_test,
+    modelo_tabpfn_treinado=None,  # TabPFN não é re-treinado em seu próprio embedding
+    nome_cenario="embeddings",
+)
+# Adiciona o TabPFN original (cenário A) como linha de referência fixa
+resultados_embedding["TabPFN (referência)"] = resultados_originais["TabPFN"]
+
+# ── Tabela comparativa consolidada ───────────────────────────────────────────
+
+linhas_comparacao = []
+for nome_m in ["Logistic Regression", "Random Forest", "XGBoost"]:
+    linhas_comparacao.append(
+        {
+            "Modelo": nome_m,
+            "F1 (Original)": round(resultados_originais[nome_m]["f1"], 4),
+            "F1 (Embedding)": round(resultados_embedding[nome_m]["f1"], 4),
+            "Δ F1": round(
+                resultados_embedding[nome_m]["f1"] - resultados_originais[nome_m]["f1"],
+                4,
+            ),
+            "Acc (Original)": round(resultados_originais[nome_m]["acc"], 4),
+            "Acc (Embedding)": round(resultados_embedding[nome_m]["acc"], 4),
+        }
+    )
+linhas_comparacao.append(
+    {
+        "Modelo": "TabPFN",
+        "F1 (Original)": round(resultados_originais["TabPFN"]["f1"], 4),
+        "F1 (Embedding)": "—",  # TabPFN não roda sobre seu próprio embedding
+        "Δ F1": "—",
+        "Acc (Original)": round(resultados_originais["TabPFN"]["acc"], 4),
+        "Acc (Embedding)": "—",
+    }
+)
+
+df_comparacao_modelos = pd.DataFrame(linhas_comparacao)
+df_comparacao_modelos.to_csv(
+    os.path.join(pasta_ml, "comparacao_modelos_original_vs_embedding.csv"), index=False
+)
+
+print("\n  Tabela comparativa (Original vs. Embedding TabPFN):")
+print(df_comparacao_modelos.to_string(index=False))
+
+# ── Plot comparativo ─────────────────────────────────────────────────────────
+
+fig, ax = plt.subplots(figsize=(9, 5))
+nomes_plot = ["Logistic\nRegression", "Random\nForest", "XGBoost", "TabPFN"]
+f1_orig_plot = [
+    resultados_originais["Logistic Regression"]["f1"],
+    resultados_originais["Random Forest"]["f1"],
+    resultados_originais["XGBoost"]["f1"],
+    resultados_originais["TabPFN"]["f1"],
+]
+f1_emb_plot = [
+    resultados_embedding["Logistic Regression"]["f1"],
+    resultados_embedding["Random Forest"]["f1"],
+    resultados_embedding["XGBoost"]["f1"],
+    None,  # TabPFN não tem barra de embedding
+]
+
+x_pos = np.arange(len(nomes_plot))
+largura = 0.35
+
+ax.bar(
+    x_pos - largura / 2,
+    f1_orig_plot,
+    largura,
+    label="Features Originais (38 dims)",
+    color="#2563EB",
+)
+f1_emb_plot_seguro = [v if v is not None else 0 for v in f1_emb_plot]
+barras_emb = ax.bar(
+    x_pos + largura / 2,
+    f1_emb_plot_seguro,
+    largura,
+    label=f"Embedding TabPFN ({EMBEDDING_DIM} dims)",
+    color="#7C3AED",
+)
+
+# Marcar visualmente que TabPFN não tem barra de embedding
+barras_emb[-1].set_alpha(0.15)
+barras_emb[-1].set_hatch("//")
+
+ax.set_xticks(x_pos)
+ax.set_xticklabels(nomes_plot)
+ax.set_ylabel("F1-score")
+ax.set_ylim(0, 1)
+ax.set_title("Comparação de Modelos: Features Originais vs. Embedding TabPFN")
+ax.legend()
+
+for i, (v_orig, v_emb) in enumerate(zip(f1_orig_plot, f1_emb_plot)):
+    ax.text(i - largura / 2, v_orig + 0.015, f"{v_orig:.3f}", ha="center", fontsize=9)
+    if v_emb is not None:
+        ax.text(i + largura / 2, v_emb + 0.015, f"{v_emb:.3f}", ha="center", fontsize=9)
+
+salvar_plot("comparacao_original_vs_embedding", pasta_ml)
+
+print(f"\n  Interpretação:")
+melhoraram = [
+    nome_m
+    for nome_m in ["Logistic Regression", "Random Forest", "XGBoost"]
+    if resultados_embedding[nome_m]["f1"] > resultados_originais[nome_m]["f1"]
+]
+if melhoraram:
+    print(f"  Modelos que melhoraram com o embedding TabPFN: {', '.join(melhoraram)}")
+    print(f"  → O espaço latente do TabPFN carrega informação preditiva extra")
+    print(f"    além das features originais para esses modelos.")
+else:
+    print(f"  Nenhum modelo melhorou com o embedding — as features originais já")
+    print(f"  capturam a informação relevante tão bem quanto o embedding bruto.")
 
 # ── 4. 4 SPLITS INDEPENDENTES DO TESTE ──────────────────────────────────────
 # discovery → treinar SAE e DTs
@@ -969,6 +1186,20 @@ for conceito in conceitos_candidatos:
 
     t_stat, p_val = stats.ttest_ind(scores_k, null_dist)
 
+    # ── Cohen's d (effect size) — artigo seção 4.2 ───────────────────────────
+    # Mede a magnitude da diferença entre os TCAV scores do conceito e a
+    # distribuição nula, em unidades de desvio-padrão conjunto (pooled SD).
+    # Complementa o p-value: um conceito pode ser estatisticamente significativo
+    # (p baixo) mas ter efeito pequeno se N for grande — Cohen's d não depende
+    # do tamanho da amostra, só da separação real entre as distribuições.
+    #   d = (média_grupo1 - média_grupo2) / SD_conjunto
+    #   SD_conjunto = sqrt( ((n1-1)*s1² + (n2-1)*s2²) / (n1+n2-2) )
+    # Artigo exige d > 0.8 (convencionalmente "efeito grande").
+    n1, n2 = len(scores_k), len(null_dist)
+    var1, var2 = np.var(scores_k, ddof=1), np.var(null_dist, ddof=1)
+    sd_pooled = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+    cohens_d = float((tcav_mean - np.mean(null_dist)) / (sd_pooled + 1e-9))
+
     resultados_tcav.append(
         {
             "fator": k,
@@ -978,6 +1209,7 @@ for conceito in conceitos_candidatos:
             "tcav_mean": round(tcav_mean, 4),
             "tcav_std": round(tcav_std, 4),
             "p_valor": p_val,
+            "cohens_d": round(cohens_d, 4),
             "desvio_chance": round(abs(tcav_mean - 0.5), 4),
             "cavs": cavs_k,
             "dt_model": conceito["dt_model"],
@@ -993,20 +1225,25 @@ if resultados_tcav:
     for i, r in enumerate(resultados_tcav):
         r["p_adj"] = round(p_adj[i], 5)
 
-    # Filtro final: significância + efeito mínimo
+    # Filtro final: significância (FDR) + efeito mínimo (desvio chance) +
+    # effect size formal (Cohen's d) — os 3 critérios do artigo combinados.
     conceitos_finais = [
         r
         for r in resultados_tcav
-        if r["p_adj"] < FDR_ALPHA and r["desvio_chance"] >= TCAV_EFFECT_MIN
+        if r["p_adj"] < FDR_ALPHA
+        and r["desvio_chance"] >= TCAV_EFFECT_MIN
+        and abs(r["cohens_d"]) >= COHENS_D_MIN
     ]
 
 print(
-    f"  Aprovados (p_adj<{FDR_ALPHA}, |TCAV-0.5|≥{TCAV_EFFECT_MIN}): {len(conceitos_finais)}"
+    f"  Aprovados (p_adj<{FDR_ALPHA}, |TCAV-0.5|≥{TCAV_EFFECT_MIN}, |d|≥{COHENS_D_MIN}): {len(conceitos_finais)}"
 )
 
 if not conceitos_finais:
     print("\n  ⚠ Nenhum conceito passou o filtro TCAV.")
-    print("  Tente: reduzir TCAV_EFFECT_MIN para 0.05, ou DT_RECALL_MIN para 0.15")
+    print(
+        "  Tente: reduzir TCAV_EFFECT_MIN para 0.05, COHENS_D_MIN para 0.5, ou DT_RECALL_MIN para 0.15"
+    )
 
 
 # ── 8. RANDOM FOREST + LASSO NOS CONCEITOS FINAIS ───────────────────────────
@@ -1117,14 +1354,19 @@ if conceitos_finais:
         # Mantém SOMENTE a componente na direção do conceito: x_suf = (x·v)v
         X_suficiente = np.outer(proj_escalar, v_dir)
         p_suficiente = predizer_proba(modelo_tabpfn, X_suficiente)
-        # Quanto da predição original o modelo retém usando só essa direção
+
+        # MÉTRICA CORRIGIDA: a razão direta p_suficiente/p_original explode
+        # quando p_original é pequeno (ex: p_original=0.12, p_suficiente=0.26
+        # → razão=2.16, fora do intervalo [0,1] e sem leitura como "fração
+        # retida"). Em vez disso, medimos a PROXIMIDADE entre a predição
+        # suficiente e a original por amostra: 1 − |p_suficiente − p_original|.
+        # Fica sempre em [0,1]: 1.0 = predição suficiente idêntica à original,
+        # 0.0 = predições opostas (uma em 0, outra em 1).
+        proximidade_por_amostra = 1.0 - np.abs(p_suficiente - p_original)
+        retencao_sufficiency = float(np.mean(proximidade_por_amostra))
+
+        # Mantido apenas como diagnóstico complementar (não usado no filtro)
         delta_sufficiency = float(np.mean(p_suficiente) - np.mean(p_original))
-        # Fração da predição original retida (1.0 = suficiente, 0.0 = nada)
-        retencao_sufficiency = (
-            float(np.mean(p_suficiente) / (np.mean(p_original) + 1e-9))
-            if np.mean(p_original) > 1e-9
-            else 0.0
-        )
 
         c["destruction_delta"] = round(delta_destruction, 4)
         c["sufficiency_delta"] = round(delta_sufficiency, 4)
@@ -1145,7 +1387,7 @@ if conceitos_finais:
                 ),  # Δp médio ≥ 0.02 → necessário
                 "suficiente": bool(
                     retencao_sufficiency >= 0.7
-                ),  # retém ≥70% → suficiente
+                ),  # proximidade ≥70% → suficiente
             }
         )
 
@@ -1161,10 +1403,10 @@ if conceitos_finais:
     n_suficientes = int(df_ablacao["suficiente"].sum())
     print(f"\n  Conceitos necessários (|Δp|≥0.02): {n_necessarios} / {len(df_ablacao)}")
     print(
-        f"  Conceitos suficientes (retenção≥70%): {n_suficientes} / {len(df_ablacao)}"
+        f"  Conceitos suficientes (proximidade≥70%): {n_suficientes} / {len(df_ablacao)}"
     )
 
-    # ── Plot: Destruction Δp vs Sufficiency retenção ─────────────────────────
+    # ── Plot: Destruction Δp vs Sufficiency proximidade ──────────────────────
     if len(df_ablacao) > 0:
         fig, axes = plt.subplots(1, 2, figsize=(14, max(4, len(df_ablacao) * 0.4 + 2)))
 
@@ -1181,15 +1423,17 @@ if conceitos_finais:
         axes[1].axvline(
             0.7, color="black", linestyle="--", linewidth=0.5, label="limiar 0.7"
         )
-        axes[1].set_xlabel("Fração da predição retida")
-        axes[1].set_title("Sufficiency Test\n(verde = suficiente, retenção≥0.7)")
+        axes[1].set_xlim(0, 1)
+        axes[1].set_xlabel("Proximidade (1 − |p_suficiente − p_original|)")
+        axes[1].set_title("Sufficiency Test\n(verde = suficiente, proximidade≥0.7)")
         axes[1].legend(fontsize=8)
 
         salvar_plot("testes_ablacao", pasta_ml)
 
     print(f"\n  Interpretação:")
     print(f"  - 'Necessário': remover a direção do conceito muda a predição em ≥2pp")
-    print(f"  - 'Suficiente': usar SÓ essa direção mantém ≥70% da predição original")
+    print(f"  - 'Suficiente': usar SÓ essa direção reproduz a predição original")
+    print(f"    com proximidade ≥70% (1 − |p_suficiente − p_original| ≥ 0.7)")
     print(f"  - Conceitos necessários E suficientes são os candidatos mais fortes a")
     print(f"    'drivers' causais da decisão do modelo, não apenas correlações.")
 
@@ -1200,6 +1444,7 @@ if conceitos_finais:
                 "tcav": c["tcav_mean"],
                 "tcav_std": c["tcav_std"],
                 "p_adj": c["p_adj"],
+                "cohens_d": c["cohens_d"],
                 "desvio_chance": c["desvio_chance"],
                 "importancia_rf": round(c["importancia_rf"], 4),
                 "precisao_dt": c["precisao"],
@@ -1284,3 +1529,52 @@ if conceitos_finais:
     ax.set_title("Ativação Média por Conceito e Classe (Held-Out)")
     handles, lbls = ax.get_legend_handles_labels()
     ax.legend(handles[:2], lbls[:2])
+    salvar_plot("ativacao_por_classe", pasta_ml)
+
+    # t-SNE dos embeddings colorido pelo top conceito
+    if len(test_emb) <= 1000:
+        top_fator = conceitos_finais[0]["fator"]
+        ativ_top = acts_held_out[:, top_fator]
+        tsne = TSNE(
+            n_components=2,
+            random_state=RANDOM_STATE,
+            perplexity=min(30, len(emb_held_out) - 1),
+        )
+        emb_2d = tsne.fit_transform(emb_held_out)
+        plt.figure(figsize=(8, 6))
+        sc = plt.scatter(
+            emb_2d[:, 0], emb_2d[:, 1], c=ativ_top, cmap="RdBu_r", alpha=0.7, s=20
+        )
+        plt.colorbar(sc, label=f"Ativação Fator {top_fator}")
+        plt.title(
+            f"t-SNE — Fator {top_fator} (top conceito)\n{conceitos_finais[0]['regra'][:60]}"
+        )
+        salvar_plot(f"tsne_fator_{top_fator}", pasta_ml)
+
+else:
+    print("\n  Nenhum conceito interpretável encontrado.")
+    print("  Parâmetros para relaxar:")
+    print(f"    DT_PRECISION_MIN = {DT_PRECISION_MIN} → tente 0.80")
+    print(f"    DT_RECALL_MIN    = {DT_RECALL_MIN} → tente 0.15")
+    print(f"    TCAV_EFFECT_MIN  = {TCAV_EFFECT_MIN} → tente 0.05")
+    print(f"    SAE_SPARSITY     = {SAE_SPARSITY} → tente 0.01")
+
+# ── Salvar métricas do SAE ───────────────────────────────────────────────────
+pd.DataFrame(
+    [
+        {
+            "embedding_dim": EMBEDDING_DIM,
+            "latent_dim": LATENT_DIM,
+            "expansion_factor": EXPANSION_FACTOR,
+            "near_zero_rate": round(near_zero_rate, 4),
+            "active_per_sample": round(active_per_sample, 2),
+            "dead_factors": len(dead_factors),
+            "active_factors": len(active_factors),
+            "high_sim_pairs": int(high_sim_pairs),
+            "candidatos_dt": len(conceitos_candidatos),
+            "conceitos_finais": len(conceitos_finais),
+        }
+    ]
+).to_csv(os.path.join(pasta_ml, "metricas_sae.csv"), index=False)
+
+print(f"\n✓ Pipeline concluído. Resultados em: {base_dir}/")
