@@ -64,12 +64,14 @@ pastas = {
     "comparacoes": os.path.join(base_dir, "comparacoes"),
     "correlacao": os.path.join(base_dir, "correlacao"),
     "ml": os.path.join(base_dir, "machine_learning"),
+    "kdd": os.path.join(base_dir, "apresentacao_kdd"),
 }
 
 for pasta in pastas.values():
     os.makedirs(pasta, exist_ok=True)
 
 pasta_ml = pastas["ml"]
+pasta_kdd = pastas["kdd"]
 
 # ── SAE / TCAV ──────────────────────────────────────────────────────────────
 EXPANSION_FACTOR = 1.5  # latent_dim = F * embedding_dim (overcomplete)
@@ -153,11 +155,21 @@ print(f"Carregando: {caminho_csv}")
 df = pd.read_csv(caminho_csv)
 print("Dataset carregado:", df.shape)
 
+# Snapshot do estado BRUTO (para a apresentação KDD mais abaixo)
+df_bruto_shape = df.shape
+colunas_brutas = df.columns.tolist()
+n_colunas_brutas = len(colunas_brutas)
+
 coluna_origem = "dataset_origem" if "dataset_origem" in df.columns else None
 
 for col in df.columns:
     if col != coluna_origem:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# Snapshot ANTES do preenchimento de faltantes (depois da coerção numérica) —
+# aqui os NaNs reais já estão visíveis, antes de qualquer imputação.
+missing_antes_imputacao = df.isna().sum()
+pct_missing_antes = (missing_antes_imputacao / len(df) * 100).round(2)
 
 colunas_vazias = [col for col in df.columns if df[col].isna().all()]
 df = df.drop(columns=colunas_vazias)
@@ -278,6 +290,224 @@ if "num" in df.columns:
     corr_target.drop("num").head(15).plot(kind="bar")
     plt.title("Top variáveis correlacionadas com doença")
     salvar_plot("top_corr", pastas["correlacao"])
+
+# ============================================================
+# APRESENTAÇÃO DO DATASET PARA KDD
+# ============================================================
+# Gráficos voltados a contar a história das etapas iniciais do processo KDD
+# (Knowledge Discovery in Databases): Seleção → Pré-processamento → Limpeza
+# → Transformação. Diferente da EDA acima (que explora relações entre
+# variáveis), esta seção foca no PROCESSO de preparação dos dados em si:
+# quanto foi removido, quanto estava faltando, como ficou o balanceamento,
+# e qual a dimensionalidade final — material de slide para "apresentar"
+# o dataset antes de entrar em modelagem.
+
+print("\n" + "=" * 60)
+print("APRESENTAÇÃO DO DATASET (KDD)")
+print("=" * 60)
+
+# ── 1. Funil do KDD: Seleção → Limpeza → Transformação ──────────────────────
+# Quantas colunas e linhas sobreviveram em cada etapa do processo.
+
+n_colunas_apos_remocao = df.shape[1]
+n_linhas_final = df.shape[0]
+
+etapas_funil = pd.DataFrame(
+    {
+        "Etapa": [
+            "1. Dataset bruto\n(seleção)",
+            "2. Após remover\ncolunas vazias/ruído\n(pré-processamento)",
+            "3. Após limpeza\ne imputação\n(transformação)",
+        ],
+        "N_Colunas": [n_colunas_brutas, n_colunas_apos_remocao, n_colunas_apos_remocao],
+        "N_Linhas": [df_bruto_shape[0], df_bruto_shape[0], n_linhas_final],
+    }
+)
+
+print("\n  Funil das etapas KDD:")
+print(etapas_funil.to_string(index=False))
+etapas_funil.to_csv(os.path.join(pasta_kdd, "funil_etapas_kdd.csv"), index=False)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+cores_funil = ["#94A3B8", "#60A5FA", "#2563EB"]
+
+axes[0].bar(range(len(etapas_funil)), etapas_funil["N_Colunas"], color=cores_funil)
+axes[0].set_xticks(range(len(etapas_funil)))
+axes[0].set_xticklabels(etapas_funil["Etapa"], fontsize=8)
+axes[0].set_ylabel("Número de Colunas")
+axes[0].set_title("Redução de Dimensionalidade\n(Seleção de Atributos)")
+for i, v in enumerate(etapas_funil["N_Colunas"]):
+    axes[0].text(i, v + 1, str(v), ha="center", fontweight="bold")
+
+axes[1].bar(range(len(etapas_funil)), etapas_funil["N_Linhas"], color=cores_funil)
+axes[1].set_xticks(range(len(etapas_funil)))
+axes[1].set_xticklabels(etapas_funil["Etapa"], fontsize=8)
+axes[1].set_ylabel("Número de Amostras")
+axes[1].set_title("Amostras Disponíveis por Etapa")
+for i, v in enumerate(etapas_funil["N_Linhas"]):
+    axes[1].text(i, v + 5, str(v), ha="center", fontweight="bold")
+
+plt.suptitle("Funil do Processo KDD", fontweight="bold")
+salvar_plot("funil_kdd", pasta_kdd)
+
+
+# ── 2. Dados faltantes ANTES da imputação ───────────────────────────────────
+# Mostra a "ferida real" dos dados antes de qualquer correção — essencial
+# para justificar as escolhas de pré-processamento na apresentação.
+
+missing_relevante = pct_missing_antes[pct_missing_antes > 0].sort_values(
+    ascending=False
+)
+
+if len(missing_relevante) > 0:
+    plt.figure(figsize=(10, max(4, len(missing_relevante) * 0.3)))
+    cores_missing = [
+        "#DC2626" if v > 50 else "#F59E0B" if v > 20 else "#FBBF24"
+        for v in missing_relevante.values
+    ]
+    plt.barh(
+        missing_relevante.index[::-1],
+        missing_relevante.values[::-1],
+        color=cores_missing[::-1],
+    )
+    plt.xlabel("% de Valores Faltantes")
+    plt.title(
+        f"Dados Faltantes Antes da Imputação\n({len(missing_relevante)} de {n_colunas_brutas} colunas afetadas)"
+    )
+    plt.axvline(50, color="#DC2626", linestyle="--", linewidth=0.8, alpha=0.5)
+    salvar_plot("missing_antes_imputacao", pasta_kdd)
+
+    print(
+        f"\n  Colunas com dados faltantes: {len(missing_relevante)} / {n_colunas_brutas}"
+    )
+    print(f"  Top 5 com mais faltantes:")
+    print(missing_relevante.head(5).to_string())
+else:
+    print("\n  Nenhum valor faltante detectado após conversão numérica.")
+
+pct_missing_antes.sort_values(ascending=False).to_csv(
+    os.path.join(pasta_kdd, "missing_values_antes_imputacao.csv"),
+    header=["pct_missing"],
+)
+
+
+# ── 3. Balanceamento do target ───────────────────────────────────────────────
+
+if "num" in df.columns:
+    contagem_target = df["num"].value_counts().sort_index()
+    pct_target = (contagem_target / contagem_target.sum() * 100).round(1)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    cores_target = ["#3B82F6", "#EF4444"]
+    axes[0].bar(
+        ["Sem Doença (0)", "Com Doença (1)"], contagem_target.values, color=cores_target
+    )
+    for i, v in enumerate(contagem_target.values):
+        axes[0].text(
+            i, v + 5, f"{v}\n({pct_target.values[i]}%)", ha="center", fontweight="bold"
+        )
+    axes[0].set_ylabel("Número de Pacientes")
+    axes[0].set_title("Balanceamento do Target")
+
+    axes[1].pie(
+        contagem_target.values,
+        labels=["Sem Doença", "Com Doença"],
+        autopct="%1.1f%%",
+        colors=cores_target,
+        startangle=90,
+        wedgeprops={"edgecolor": "white", "linewidth": 1.5},
+    )
+    axes[1].set_title("Proporção das Classes")
+
+    plt.suptitle("Distribuição da Variável Alvo (num)", fontweight="bold")
+    salvar_plot("balanceamento_target", pasta_kdd)
+
+    print(f"\n  Balanceamento do target:")
+    for classe, qtd, pct in zip(
+        contagem_target.index, contagem_target.values, pct_target.values
+    ):
+        print(f"    Classe {classe}: {qtd} amostras ({pct}%)")
+
+
+# ── 4. Composição por dataset de origem (se houver) ──────────────────────────
+
+if coluna_origem and coluna_origem in df.columns:
+    contagem_origem = df[coluna_origem].value_counts()
+
+    plt.figure(figsize=(8, 5))
+    bars = plt.bar(
+        contagem_origem.index.astype(str),
+        contagem_origem.values,
+        color="#7C3AED",
+        alpha=0.85,
+    )
+    plt.ylabel("Número de Amostras")
+    plt.title("Composição do Dataset por Origem\n(Etapa de Seleção/Integração — KDD)")
+    plt.xticks(rotation=30, ha="right")
+    for bar, v in zip(bars, contagem_origem.values):
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            v + 2,
+            str(v),
+            ha="center",
+            fontweight="bold",
+        )
+    salvar_plot("composicao_por_origem", pasta_kdd)
+
+    print(f"\n  Composição por origem:")
+    print(contagem_origem.to_string())
+
+
+# ── 5. Tipos de variáveis (numéricas vs categóricas) ─────────────────────────
+
+n_num = len(colunas_numericas)
+n_cat = len(colunas_categoricas)
+
+plt.figure(figsize=(6, 6))
+plt.pie(
+    [n_num, n_cat],
+    labels=[f"Numéricas\n({n_num})", f"Categóricas\n({n_cat})"],
+    autopct="%1.1f%%",
+    colors=["#10B981", "#F59E0B"],
+    startangle=90,
+    wedgeprops={"edgecolor": "white", "linewidth": 1.5},
+)
+plt.title(f"Composição dos Atributos\n({n_num + n_cat} features após seleção)")
+salvar_plot("tipos_de_variaveis", pasta_kdd)
+
+print(f"\n  Tipos de variáveis: {n_num} numéricas, {n_cat} categóricas")
+
+
+# ── 6. Resumo executivo (texto para slide) ──────────────────────────────────
+
+resumo_kdd = pd.DataFrame(
+    [
+        {"Métrica": "Amostras (linhas) — bruto", "Valor": df_bruto_shape[0]},
+        {"Métrica": "Colunas — bruto", "Valor": n_colunas_brutas},
+        {
+            "Métrica": "Colunas removidas (vazias/ruído/leakage)",
+            "Valor": n_colunas_brutas - n_colunas_apos_remocao,
+        },
+        {
+            "Métrica": "Colunas finais (features + target)",
+            "Valor": n_colunas_apos_remocao,
+        },
+        {"Métrica": "Amostras finais", "Valor": n_linhas_final},
+        {"Métrica": "Variáveis numéricas", "Valor": n_num},
+        {"Métrica": "Variáveis categóricas", "Valor": n_cat},
+        {
+            "Métrica": "Colunas com dados faltantes (bruto)",
+            "Valor": int((pct_missing_antes > 0).sum()),
+        },
+    ]
+)
+resumo_kdd.to_csv(os.path.join(pasta_kdd, "resumo_executivo_kdd.csv"), index=False)
+
+print("\n  Resumo executivo (para slide):")
+print(resumo_kdd.to_string(index=False))
+print(f"\n  Gráficos KDD salvos em: {pasta_kdd}/")
 
 # ==============================
 # FEATURES / TARGET
